@@ -638,9 +638,8 @@ function ConcentrateMaker({ globalParams, setGlobalParams, concentrateData, setC
 }
 
 // ─── FORWARD CRAFTER ──────────────────────────────────────────────────────────
-function ForwardCrafter({ globalParams, concentrateData }) {
+function ForwardCrafter({ globalParams, concentrateData, amounts, setAmounts }) {
   const { brewMl, dropG } = globalParams;
-  const [amounts, setAmounts] = useState({});
   const mineralAmounts = useMemo(() => Object.entries(amounts).filter(([_, p]) => p > 0).map(([mineralId, ppm]) => ({ mineralId, ppm })), [amounts]);
   const stats = useMemo(() => calcWaterStats(mineralAmounts, brewMl || 500), [mineralAmounts, brewMl]);
 
@@ -692,10 +691,8 @@ function ForwardCrafter({ globalParams, concentrateData }) {
 }
 
 // ─── REVERSE CRAFTER ──────────────────────────────────────────────────────────
-function ReverseCrafter({ globalParams, concentrateData }) {
+function ReverseCrafter({ globalParams, concentrateData, targets, setTargets, sel, setSel }) {
   const { brewMl, dropG } = globalParams;
-  const [targets, setTargets] = useState({ gh: 60, kh: 20, caToMg: 1.3, clToSO4: 1.0 });
-  const [sel, setSel] = useState(["mgcl2_6h2o", "mgso4_7h2o", "cacl2_2h2o", "nahco3"]);
   const toggle = id => setSel(p => p.includes(id) ? p.filter(x => x !== id) : [...p, id]);
   const results = useMemo(() => solveReverse(targets, sel), [targets, sel]);
   const stats = useMemo(() => results ? calcWaterStats(results, brewMl || 500) : null, [results, brewMl]);
@@ -780,6 +777,15 @@ function App() {
   });
   const [mode, setMode] = useState("forward");
 
+  // Forward crafter state (lifted so it persists across tab switches)
+  const [fwdAmounts, setFwdAmounts] = useState({
+    mgcl2_6h2o: 13, nacl: 13, nahco3: 8,
+  });
+
+  // Reverse crafter state (lifted)
+  const [revTargets, setRevTargets] = useState({ gh: 60, kh: 20, caToMg: 1.3, clToSO4: 1.0 });
+  const [revSel, setRevSel] = useState(["mgcl2_6h2o", "mgso4_7h2o", "cacl2_2h2o", "nahco3"]);
+
   return (
     <div style={{ minHeight: "100vh", background: C.bg, color: C.text, fontFamily: "'Segoe UI', -apple-system, sans-serif" }}>
       <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet" />
@@ -808,7 +814,9 @@ function App() {
               <Tab active={mode === "forward"} onClick={() => setMode("forward")}>Minerals → Water Stats</Tab>
               <Tab active={mode === "reverse"} onClick={() => setMode("reverse")}>Targets → Recipe</Tab>
             </div>
-            {mode === "forward" ? <ForwardCrafter globalParams={gp} concentrateData={cd} /> : <ReverseCrafter globalParams={gp} concentrateData={cd} />}
+            {mode === "forward"
+              ? <ForwardCrafter globalParams={gp} concentrateData={cd} amounts={fwdAmounts} setAmounts={setFwdAmounts} />
+              : <ReverseCrafter globalParams={gp} concentrateData={cd} targets={revTargets} setTargets={setRevTargets} sel={revSel} setSel={setRevSel} />}
           </div>
         )}
       </div>
