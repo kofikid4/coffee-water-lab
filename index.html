@@ -29,8 +29,8 @@ const MW = {
   Cl: 35.45, SO4: 96.06, HCO3: 61.01, H2O: 18.015, SiO2: 60.08,
 };
 
-// Eidon Silica Concentrate: 375mg SiO2 per 30 drops (2ml) → 187.5 mg/ml
-const EIDON_SILICA_MG_PER_ML = 187.5;
+// Eidon Silica Concentrate: 375mg SiO2 per serving, 30 servings in 2oz (59.15ml) → 190.2 mg/ml
+const EIDON_SILICA_MG_PER_ML = 190.2;
 
 const MINERALS = [
   // ── GH: Magnesium Sources ──
@@ -86,7 +86,7 @@ const MINERALS = [
     ppmFactor: 100,
     ions: (mmol) => ({ Ca: mmol * MW.Ca, Cl: mmol * 2 * MW.Cl }),
     ionMmol: (mmol) => ({ Ca: mmol, Cl: mmol * 2, SO4: 0, Mg: 0, Na: 0, K: 0, HCO3: 0 }),
-    solubility: 98.69, prevalence: 3,
+    solubility: 98.69, prevalence: 7,
     buyNote: "Pure Original Ingredients (Amazon)",
   },
   {
@@ -95,7 +95,7 @@ const MINERALS = [
     ppmFactor: 100,
     ions: (mmol) => ({ Ca: mmol * MW.Ca, Cl: mmol * 2 * MW.Cl }),
     ionMmol: (mmol) => ({ Ca: mmol, Cl: mmol * 2, SO4: 0, Mg: 0, Na: 0, K: 0, HCO3: 0 }),
-    solubility: 74.5, prevalence: 7,
+    solubility: 74.5, prevalence: 3,
     buyNote: "Pure Original Ingredients (Amazon) — exothermic when dissolving",
   },
   {
@@ -167,13 +167,15 @@ function calcConcentrate(mineral, targetPpmPerDrop, brewMl, bottleMl, dropG) {
   if (mineral.isPreConcentrate) {
     const brewL = brewMl / 1000;
     const mgPerDrop = targetPpmPerDrop * brewL;
-    const dropsPerBottle = bottleMl / dropG;
+    // bottleMl here = amount of distilled water, total volume = water + eidon
+    const totalVolMl_approx = bottleMl; // start with water as estimate for drop count
+    const dropsPerBottle = totalVolMl_approx / dropG;
     const totalSiO2_mg = mgPerDrop * dropsPerBottle;
     const eidonMl = totalSiO2_mg / EIDON_SILICA_MG_PER_ML;
-    const waterMl = bottleMl - eidonMl;
+    const totalBottle = bottleMl + eidonMl;
     const ppmPerMl = (1 / dropG) * targetPpmPerDrop;
     const ppmPerVolume = [0.25, 0.5, 0.75, 1.0].map(v => +(v * ppmPerMl).toFixed(1));
-    return { eidonMl, waterMl, totalSiO2_mg, ppmPerVolume, isSilica: true, solubilityOk: eidonMl < bottleMl };
+    return { eidonMl, waterMl: bottleMl, totalBottle, totalSiO2_mg, ppmPerVolume, isSilica: true, solubilityOk: true };
   }
   const massPerPpm = mineral.ppmFactor === null ? 1 : mineral.mw / mineral.ppmFactor;
   const brewL = brewMl / 1000;
@@ -594,11 +596,10 @@ function ConcentrateMaker({ globalParams, setGlobalParams, concentrateData, setC
                             {result.isSilica ? (
                               <div>
                                 <span style={{ fontSize: 12, color: C.textBright, fontFamily: "'JetBrains Mono', monospace" }}>
-                                  Add <b style={{ color: C.accent }}>{result.eidonMl.toFixed(2)}ml</b> Eidon Silica Concentrate
-                                  + <b style={{ color: C.accent }}>{result.waterMl.toFixed(1)}ml</b> distilled water
+                                  Add <b style={{ color: C.accent }}>{result.eidonMl.toFixed(2)}ml</b> of Eidon Silica Concentrate to {bottleMl}ml distilled water
                                 </span>
                                 <div style={{ fontSize: 10, color: C.textDim, marginTop: 2 }}>
-                                  Eidon 2oz concentrate = 375mg SiO₂ per 2ml (187.5 mg/ml)
+                                  Eidon 2oz concentrate = 190.2 mg SiO₂/ml
                                 </div>
                               </div>
                             ) : (
@@ -766,13 +767,234 @@ function ReverseCrafter({ globalParams, concentrateData, targets, setTargets, se
   );
 }
 
+// ─── RECIPE ANALYZER ──────────────────────────────────────────────────────────
+const RECIPE_MINERALS = MINERALS.filter(m => m.id !== "sio2");
+
+function RecipeAnalyzer({ recipe, setRecipe }) {
+  const { mode, brewMl, linked, concVol, dose, grams, perMineral, silicaPpm } = recipe;
+  const set = (k, v) => setRecipe(p => ({ ...p, [k]: v }));
+  const setGram = (id, v) => setRecipe(p => ({ ...p, grams: { ...p.grams, [id]: v } }));
+  const setPM = (id, field, v) => setRecipe(p => ({
+    ...p, perMineral: { ...p.perMineral, [id]: { ...(p.perMineral[id] || {}), [field]: v } }
+  }));
+
+  const mineralAmounts = useMemo(() => {
+    const results = [];
+    const brewL = (brewMl || 1000) / 1000;
+
+    RECIPE_MINERALS.forEach(m => {
+      const g = grams[m.id];
+      if (!g || g <= 0) return;
+
+      let mg_in_brew;
+      if (mode === "direct") {
+        mg_in_brew = g * 1000;
+      } else if (linked) {
+        const cv = concVol || 500;
+        const d = dose || 1;
+        mg_in_brew = (g * 1000 / cv) * d;
+      } else {
+        const pm = perMineral[m.id] || {};
+        const cv = pm.concVol || 50;
+        const d = pm.dose || 1;
+        mg_in_brew = (g * 1000 / cv) * d;
+      }
+
+      const mgPerL = mg_in_brew / brewL;
+      let ppm;
+      if (m.ppmFactor === null) { ppm = mgPerL; }
+      else { ppm = (mgPerL / m.mw) * m.ppmFactor; }
+
+      results.push({ mineralId: m.id, ppm });
+    });
+
+    if (silicaPpm > 0) results.push({ mineralId: "sio2", ppm: silicaPpm });
+    return results;
+  }, [grams, mode, brewMl, linked, concVol, dose, perMineral, silicaPpm]);
+
+  const stats = useMemo(() => calcWaterStats(mineralAmounts, brewMl || 1000), [mineralAmounts, brewMl]);
+
+  // Per-mineral display: show calculated ppm
+  const getPpm = (id) => {
+    const found = mineralAmounts.find(a => a.mineralId === id);
+    return found ? found.ppm : 0;
+  };
+
+  return (
+    <div>
+      <p style={{ fontSize: 12, color: C.textDim, marginBottom: 16, lineHeight: 1.6 }}>
+        Paste in someone's recipe — enter grams of each mineral. Supports direct dosing (grams into brew water) and
+        concentrate recipes (grams into a concentrate bottle, then dose into brew water).
+      </p>
+
+      {/* Mode toggle */}
+      <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
+        <Tab active={mode === "direct"} onClick={() => set("mode", "direct")}>Direct Dose</Tab>
+        <Tab active={mode === "concentrate"} onClick={() => set("mode", "concentrate")}>From Concentrate</Tab>
+      </div>
+
+      {/* Brew volume */}
+      <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 16 }}>
+        <div style={{ minWidth: 160 }}>
+          <label style={{ fontSize: 10, color: C.textDim, textTransform: "uppercase", letterSpacing: 0.8 }}>
+            {mode === "direct" ? "Brew Water Volume" : "Final Brew Water Volume"}
+          </label>
+          <NI value={brewMl} onChange={v => set("brewMl", v)} min={1} step={100} unit="ml" />
+        </div>
+
+        {/* Concentrate params */}
+        {mode === "concentrate" && (
+          <>
+            <div style={{ display: "flex", alignItems: "end", gap: 6, marginBottom: 0 }}>
+              <Tab active={linked} onClick={() => set("linked", true)}>All-in-One</Tab>
+              <Tab active={!linked} onClick={() => set("linked", false)}>Separate Bottles</Tab>
+            </div>
+            {linked && (
+              <>
+                <div style={{ minWidth: 140 }}>
+                  <label style={{ fontSize: 10, color: C.textDim, textTransform: "uppercase", letterSpacing: 0.8 }}>Concentrate Water</label>
+                  <NI value={concVol} onChange={v => set("concVol", v)} min={1} step={50} unit="ml" />
+                </div>
+                <div style={{ minWidth: 140 }}>
+                  <label style={{ fontSize: 10, color: C.textDim, textTransform: "uppercase", letterSpacing: 0.8 }}>Amount Used</label>
+                  <NI value={dose} onChange={v => set("dose", v)} min={0} step={0.1} unit="g ≈ ml" />
+                </div>
+              </>
+            )}
+          </>
+        )}
+      </div>
+
+      {/* Mineral inputs */}
+      {CATEGORY_ORDER.map(cat => {
+        const mins = RECIPE_MINERALS.filter(m => m.category === cat).sort((a, b) => a.prevalence - b.prevalence);
+        if (!mins.length) return null;
+        return (
+          <div key={cat} style={{ marginBottom: 8 }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: catC[cat], marginBottom: 6, letterSpacing: 0.5, textTransform: "uppercase" }}>
+              {CATEGORY_LABELS[cat]}
+            </div>
+            {mins.map(mineral => {
+              const g = grams[mineral.id] || "";
+              const ppm = getPpm(mineral.id);
+              const isCaCO3 = mineral.ppmFactor !== null;
+              const pm = perMineral[mineral.id] || {};
+
+              return (
+                <div key={mineral.id} style={{
+                  display: "flex", alignItems: "center", gap: 8, marginBottom: 4, flexWrap: "wrap",
+                  background: C.surface, borderRadius: 6, padding: "6px 12px", border: `1px solid ${C.border}`,
+                }}>
+                  <div style={{ minWidth: 130, flex: "0 0 130px" }}>
+                    <div style={{ fontSize: 12, fontWeight: 600, color: C.textBright }}>{mineral.common}</div>
+                    <div style={{ fontSize: 10, color: C.textDim }}>{mineral.formula}</div>
+                  </div>
+
+                  <NI value={g} onChange={v => setGram(mineral.id, v)} min={0} step={0.01}
+                    placeholder="0" unit="g" style={{ width: 100 }} />
+
+                  {/* Separate concentrate inputs */}
+                  {mode === "concentrate" && !linked && (
+                    <>
+                      <NI value={pm.concVol || ""} onChange={v => setPM(mineral.id, "concVol", v)}
+                        min={1} step={10} placeholder="50" unit="ml conc" style={{ width: 100 }} />
+                      <NI value={pm.dose || ""} onChange={v => setPM(mineral.id, "dose", v)}
+                        min={0} step={0.1} placeholder="1" unit="g used" style={{ width: 100 }} />
+                    </>
+                  )}
+
+                  {/* Calculated ppm */}
+                  {ppm > 0 && (
+                    <div style={{
+                      background: C.inputBg, borderRadius: 4, padding: "3px 8px",
+                      border: `1px solid ${C.border}`, textAlign: "center",
+                    }}>
+                      <div style={{ fontSize: 9, color: C.textDim }}>{isCaCO3 ? "ppm CaCO₃" : "mg/L"}</div>
+                      <div style={{ fontSize: 13, fontWeight: 700, color: catC[cat], fontFamily: "'JetBrains Mono', monospace" }}>
+                        {ppm.toFixed(1)}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        );
+      })}
+
+      {/* Silica input */}
+      <div style={{
+        display: "flex", alignItems: "center", gap: 8, marginBottom: 4,
+        background: C.surface, borderRadius: 6, padding: "6px 12px", border: `1px solid ${C.border}`,
+      }}>
+        <div style={{ minWidth: 130, flex: "0 0 130px" }}>
+          <div style={{ fontSize: 12, fontWeight: 600, color: C.textBright }}>Silica</div>
+          <div style={{ fontSize: 10, color: C.textDim }}>SiO₂</div>
+        </div>
+        <NI value={silicaPpm || ""} onChange={v => set("silicaPpm", v)} min={0} step={0.5}
+          placeholder="0" unit="mg/L" style={{ width: 100 }} />
+        <div style={{ fontSize: 10, color: C.textDim }}>1 Eidon drop in 2L ≈ 6.25 mg/L</div>
+      </div>
+
+      {/* Results */}
+      <div style={{ marginTop: 16 }}>
+        <div style={{ fontSize: 12, fontWeight: 700, color: C.textBright, marginBottom: 10 }}>Recipe Analysis</div>
+
+        {/* Summary of calculated ppm */}
+        {mineralAmounts.length > 0 && (
+          <div style={{
+            background: C.surfaceAlt, borderRadius: 8, padding: 12, marginBottom: 12,
+            border: `1px solid ${C.border}`,
+          }}>
+            <div style={{ fontSize: 10, color: C.textDim, textTransform: "uppercase", letterSpacing: 0.8, marginBottom: 8 }}>
+              Mineral Breakdown
+            </div>
+            {mineralAmounts.map(({ mineralId, ppm }) => {
+              const m = MINERALS.find(x => x.id === mineralId);
+              const isCaCO3 = m.ppmFactor !== null;
+              const g = grams[mineralId] || 0;
+              const brewL = (brewMl || 1000) / 1000;
+              let mgPerL;
+              if (m.id === "sio2") { mgPerL = ppm; }
+              else if (mode === "direct") { mgPerL = (g * 1000) / brewL; }
+              else if (linked) { mgPerL = (g * 1000 / (concVol || 500)) * (dose || 1) / brewL; }
+              else { const pm2 = perMineral[mineralId] || {}; mgPerL = (g * 1000 / (pm2.concVol || 50)) * (pm2.dose || 1) / brewL; }
+
+              return (
+                <div key={mineralId} style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 4, fontSize: 12 }}>
+                  <span style={{ color: C.textBright, fontWeight: 600, minWidth: 120 }}>{m.common}</span>
+                  <span style={{ color: C.textDim, fontFamily: "'JetBrains Mono', monospace", minWidth: 70 }}>
+                    {mgPerL.toFixed(1)} mg/L
+                  </span>
+                  {isCaCO3 && (
+                    <span style={{ color: catC[m.category], fontWeight: 600, fontFamily: "'JetBrains Mono', monospace" }}>
+                      → {ppm.toFixed(1)} ppm CaCO₃
+                    </span>
+                  )}
+                  {!isCaCO3 && m.id !== "sio2" && (
+                    <span style={{ color: catC[m.category], fontWeight: 600, fontFamily: "'JetBrains Mono', monospace" }}>
+                      → {ppm.toFixed(1)} mg/L
+                    </span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        <WaterStats stats={stats} />
+      </div>
+    </div>
+  );
+}
+
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 function App() {
   const [tab, setTab] = useState("concentrate");
   const [gp, setGp] = useState({ brewMl: 500, bottleMl: 30, dropG: 0.043 });
   const [cd, setCd] = useState(() => {
     const d = {};
-    MINERALS.forEach(m => { d[m.id] = m.isPreConcentrate ? 1 : 1; });
+    MINERALS.forEach(m => { d[m.id] = 1; });
     return d;
   });
   const [mode, setMode] = useState("forward");
@@ -785,6 +1007,12 @@ function App() {
   // Reverse crafter state (lifted)
   const [revTargets, setRevTargets] = useState({ gh: 60, kh: 20, caToMg: 1.3, clToSO4: 1.0 });
   const [revSel, setRevSel] = useState(["mgcl2_6h2o", "mgso4_7h2o", "cacl2_2h2o", "nahco3"]);
+
+  // Recipe analyzer state (lifted)
+  const [recipe, setRecipe] = useState({
+    mode: "direct", brewMl: 1000, linked: true, concVol: 500, dose: 2,
+    grams: {}, perMineral: {}, silicaPpm: 0,
+  });
 
   return (
     <div style={{ minHeight: "100vh", background: C.bg, color: C.text, fontFamily: "'Segoe UI', -apple-system, sans-serif" }}>
@@ -810,13 +1038,14 @@ function App() {
         {tab === "crafter" && (
           <div>
             <SH icon="⚗️">Water Crafter</SH>
-            <div style={{ display: "flex", gap: 6, marginBottom: 16 }}>
-              <Tab active={mode === "forward"} onClick={() => setMode("forward")}>Minerals → Water Stats</Tab>
+            <div style={{ display: "flex", gap: 6, marginBottom: 16, flexWrap: "wrap" }}>
+              <Tab active={mode === "forward"} onClick={() => setMode("forward")}>Minerals → Stats</Tab>
               <Tab active={mode === "reverse"} onClick={() => setMode("reverse")}>Targets → Recipe</Tab>
+              <Tab active={mode === "recipe"} onClick={() => setMode("recipe")}>📋 Recipe Analyzer</Tab>
             </div>
-            {mode === "forward"
-              ? <ForwardCrafter globalParams={gp} concentrateData={cd} amounts={fwdAmounts} setAmounts={setFwdAmounts} />
-              : <ReverseCrafter globalParams={gp} concentrateData={cd} targets={revTargets} setTargets={setRevTargets} sel={revSel} setSel={setRevSel} />}
+            {mode === "forward" && <ForwardCrafter globalParams={gp} concentrateData={cd} amounts={fwdAmounts} setAmounts={setFwdAmounts} />}
+            {mode === "reverse" && <ReverseCrafter globalParams={gp} concentrateData={cd} targets={revTargets} setTargets={setRevTargets} sel={revSel} setSel={setRevSel} />}
+            {mode === "recipe" && <RecipeAnalyzer recipe={recipe} setRecipe={setRecipe} />}
           </div>
         )}
       </div>
