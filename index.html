@@ -228,40 +228,6 @@ function calcWaterStats(mineralAmounts, brewMl) {
     TDS, conductivity, ecTdsReading, silicaPpm, naBufferMmol, kBufferMmol };
 }
 
-function solveReverse(targets, availableMinerals) {
-  const { gh, kh, caToMg, clToSO4 } = targets;
-  const mgMs = availableMinerals.filter(id => MINERALS.find(m => m.id === id)?.subcat === "mg");
-  const caMs = availableMinerals.filter(id => MINERALS.find(m => m.id === id)?.subcat === "ca");
-  const bufMs = availableMinerals.filter(id => MINERALS.find(m => m.id === id)?.subcat === "buffer");
-  if (!mgMs.length || !caMs.length || !bufMs.length) return null;
-  const tot = gh / 100, mgMmol = tot / (caToMg + 1), caMmol = caToMg * mgMmol, hco3Mmol = kh / 50;
-  const hasMgCl = mgMs.some(id => MINERALS.find(m => m.id === id)?.formula.includes("Cl"));
-  const hasMgSO4 = mgMs.some(id => MINERALS.find(m => m.id === id)?.formula.includes("SO"));
-  const hasCaCl = caMs.some(id => MINERALS.find(m => m.id === id)?.formula.includes("Cl"));
-  const hasCaSO4 = caMs.some(id => MINERALS.find(m => m.id === id)?.formula.includes("SO"));
-  const mgClM = mgMs.find(id => MINERALS.find(m => m.id === id)?.formula.includes("Cl"));
-  const mgSO4M = mgMs.find(id => MINERALS.find(m => m.id === id)?.formula.includes("SO"));
-  const caClM = caMs.find(id => MINERALS.find(m => m.id === id)?.formula.includes("Cl"));
-  const caSO4M = caMs.find(id => MINERALS.find(m => m.id === id)?.formula.includes("SO"));
-  let f;
-  if (!hasMgSO4 && !hasCaSO4) f = 1;
-  else if (!hasMgCl && !hasCaCl) f = 0;
-  else f = clToSO4 / (2 + clToSO4);
-  let mgCl = hasMgCl ? f * mgMmol : 0, mgSO4 = hasMgSO4 ? (1 - f) * mgMmol : 0;
-  let caCl = hasCaCl ? f * caMmol : 0, caSO4 = hasCaSO4 ? (1 - f) * caMmol : 0;
-  if (!hasMgCl) { mgSO4 = mgMmol; mgCl = 0; } if (!hasMgSO4) { mgCl = mgMmol; mgSO4 = 0; }
-  if (!hasCaCl) { caSO4 = caMmol; caCl = 0; } if (!hasCaSO4) { caCl = caMmol; caSO4 = 0; }
-  let r = [];
-  if (mgCl > 0 && mgClM) r.push({ mineralId: mgClM, ppm: mgCl * 100 });
-  if (mgSO4 > 0 && mgSO4M) r.push({ mineralId: mgSO4M, ppm: mgSO4 * 100 });
-  if (caCl > 0 && caClM) r.push({ mineralId: caClM, ppm: caCl * 100 });
-  if (caSO4 > 0 && caSO4M) r.push({ mineralId: caSO4M, ppm: caSO4 * 100 });
-  if (bufMs.length > 0 && hco3Mmol > 0) {
-    const per = hco3Mmol / bufMs.length;
-    bufMs.forEach(id => r.push({ mineralId: id, ppm: per * 50 }));
-  }
-  return r;
-}
 
 // ─── STYLES ───────────────────────────────────────────────────────────────────
 const C = {
@@ -691,82 +657,705 @@ function ForwardCrafter({ globalParams, concentrateData, amounts, setAmounts }) 
   );
 }
 
-// ─── REVERSE CRAFTER ──────────────────────────────────────────────────────────
-function ReverseCrafter({ globalParams, concentrateData, targets, setTargets, sel, setSel }) {
+
+
+
+
+// ─── WATER DESIGNER ───────────────────────────────────────────────────────────
+
+function LockBtn({ locked, onClick }) {
+  return (
+    <button onClick={onClick} style={{
+      background: "none", border: "none", cursor: "pointer", fontSize: 12,
+      padding: "0 2px", opacity: locked ? 1 : 0.35, transition: "opacity 0.15s",
+    }}>{locked ? "🔒" : "🔓"}</button>
+  );
+}
+
+const ION_FIELDS = [
+  { key: "Ca", label: "Ca²⁺", color: "#5ba37a", valence: 2, group: "cation" },
+  { key: "Mg", label: "Mg²⁺", color: "#3d9e6e", valence: 2, group: "cation" },
+  { key: "Na", label: "Na⁺", color: "#8b6bb0", valence: 1, group: "cation" },
+  { key: "K", label: "K⁺", color: "#a07ec8", valence: 1, group: "cation" },
+  { key: "HCO3", label: "HCO₃⁻", color: "#b08d4a", valence: 1, group: "anion" },
+  { key: "Cl", label: "Cl⁻", color: "#4a9ebb", valence: 1, group: "anion" },
+  { key: "SO4", label: "SO₄²⁻", color: "#3a8aa8", valence: 2, group: "anion" },
+];
+
+function ionSolve(ions, sel, silicaMgL) {
+  const { Ca, Mg, Na, K, HCO3, Cl, SO4 } = ions;
+  const bufMs = sel.filter(id => MINERALS.find(m => m.id === id)?.subcat === "buffer");
+  const mgMs = sel.filter(id => MINERALS.find(m => m.id === id)?.subcat === "mg");
+  const caMs = sel.filter(id => MINERALS.find(m => m.id === id)?.subcat === "ca");
+  const hasNaCl = sel.includes("nacl");
+  const hasKCl = sel.includes("kcl");
+  const hasNaHCO3 = bufMs.includes("nahco3");
+  const hasKHCO3 = bufMs.includes("khco3");
+
+  let results = [];
+  let warnings = [];
+
+  // 1. Buffer: allocate HCO3
+  let naBuffer = 0, kBuffer = 0;
+  if (HCO3 > 0) {
+    if (hasNaHCO3 && hasKHCO3) {
+      // Split based on available Na and K
+      const totalBufCation = Na + K;
+      if (totalBufCation > 0) {
+        kBuffer = Math.min(K, HCO3 * (K / totalBufCation));
+        naBuffer = Math.min(Na, HCO3 - kBuffer);
+      } else { naBuffer = HCO3; }
+    } else if (hasNaHCO3) { naBuffer = HCO3; }
+    else if (hasKHCO3) { kBuffer = HCO3; }
+    else { warnings.push({ key: "HCO3", msg: "No buffer mineral selected" }); }
+    if (naBuffer > 0) results.push({ mineralId: "nahco3", ppm: naBuffer * 50 });
+    if (kBuffer > 0) results.push({ mineralId: "khco3", ppm: kBuffer * 50 });
+  }
+
+  // 2. NaCl, KCl for remaining Na/K
+  const naRemain = Math.max(0, Na - naBuffer);
+  const kRemain = Math.max(0, K - kBuffer);
+  if (naRemain > 0) {
+    if (hasNaCl) results.push({ mineralId: "nacl", ppm: naRemain * MW.Na + naRemain * MW.Cl });
+    else warnings.push({ key: "Na", msg: "No NaCl selected for remaining Na⁺" });
+  }
+  if (kRemain > 0) {
+    if (hasKCl) results.push({ mineralId: "kcl", ppm: kRemain * MW.K + kRemain * MW.Cl });
+    else warnings.push({ key: "K", msg: "No KCl selected for remaining K⁺" });
+  }
+
+  // 3. Hardness minerals
+  const clFromNaKCl = naRemain + kRemain;
+  const clForHardness = Math.max(0, Cl - clFromNaKCl);
+  const so4ForHardness = SO4;
+
+  if (Mg > 0 || Ca > 0) {
+    if (mgMs.length === 0 && Mg > 0) warnings.push({ key: "Mg", msg: "No Mg mineral selected" });
+    if (caMs.length === 0 && Ca > 0) warnings.push({ key: "Ca", msg: "No Ca mineral selected" });
+
+    const hasMgCl = mgMs.some(id => MINERALS.find(m => m.id === id)?.formula.includes("Cl"));
+    const hasMgSO4 = mgMs.some(id => MINERALS.find(m => m.id === id)?.formula.includes("SO"));
+    const hasCaCl = caMs.some(id => MINERALS.find(m => m.id === id)?.formula.includes("Cl"));
+    const hasCaSO4 = caMs.some(id => MINERALS.find(m => m.id === id)?.formula.includes("SO"));
+
+    // Determine Cl/SO4 split for Mg
+    let mgCl = 0, mgSO4 = 0;
+    if (Mg > 0 && mgMs.length > 0) {
+      if (hasMgCl && hasMgSO4) {
+        const totalAnion = clForHardness + so4ForHardness;
+        if (totalAnion > 0) {
+          mgSO4 = Math.min(Mg, so4ForHardness * (Mg / (Mg + Ca)));
+          mgCl = Mg - mgSO4;
+        } else { mgCl = Mg; }
+      } else if (hasMgCl) { mgCl = Mg; }
+      else if (hasMgSO4) { mgSO4 = Mg; }
+    }
+
+    let caCl = 0, caSO4 = 0;
+    if (Ca > 0 && caMs.length > 0) {
+      if (hasCaCl && hasCaSO4) {
+        const so4Remain = Math.max(0, so4ForHardness - mgSO4);
+        caSO4 = Math.min(Ca, so4Remain);
+        caCl = Ca - caSO4;
+      } else if (hasCaCl) { caCl = Ca; }
+      else if (hasCaSO4) { caSO4 = Ca; }
+    }
+
+    const mgClMin = mgMs.find(id => MINERALS.find(m => m.id === id)?.formula.includes("Cl"));
+    const mgSO4Min = mgMs.find(id => MINERALS.find(m => m.id === id)?.formula.includes("SO"));
+    const caClMin = caMs.find(id => MINERALS.find(m => m.id === id)?.formula.includes("Cl"));
+    const caSO4Min = caMs.find(id => MINERALS.find(m => m.id === id)?.formula.includes("SO"));
+
+    if (mgCl > 0 && mgClMin) results.push({ mineralId: mgClMin, ppm: mgCl * 100 });
+    if (mgSO4 > 0 && mgSO4Min) results.push({ mineralId: mgSO4Min, ppm: mgSO4 * 100 });
+    if (caCl > 0 && caClMin) results.push({ mineralId: caClMin, ppm: caCl * 100 });
+    if (caSO4 > 0 && caSO4Min) results.push({ mineralId: caSO4Min, ppm: caSO4 * 100 });
+
+    // Check anion balance
+    if (!hasMgSO4 && !hasCaSO4 && SO4 > 0) warnings.push({ key: "SO4", msg: "No sulfate mineral selected — can't deliver SO₄²⁻" });
+    if (!hasMgCl && !hasCaCl && clForHardness > 0 && !hasNaCl && !hasKCl) warnings.push({ key: "Cl", msg: "No chloride mineral selected for hardness Cl⁻" });
+  }
+
+  if (silicaMgL > 0) results.push({ mineralId: "sio2", ppm: silicaMgL });
+
+  return { results, warnings };
+}
+
+function computeStats(ions, silica) {
+  const ionsMgL = {};
+  const ionsCaCO3 = {};
+  ION_FIELDS.forEach(f => {
+    ionsMgL[f.key] = ions[f.key] * MW[f.key];
+    ionsCaCO3[f.key] = ions[f.key] * (f.valence === 2 ? 100 : 50);
+  });
+  const GH = (ions.Ca + ions.Mg) * 100;
+  const KH = ions.HCO3 * 50;
+  const TDS = Object.values(ionsMgL).reduce((a, b) => a + b, 0) + (silica || 0);
+  const conductivity = ions.Ca * 119 + ions.Mg * 106 + ions.Na * 50.1 + ions.K * 73.5 +
+    ions.HCO3 * 44.5 + ions.SO4 * 160 + ions.Cl * 76.35;
+  const ecTds = conductivity * 0.5;
+  const tempHardness = Math.min(GH, KH);
+  const permHardness = GH - tempHardness;
+  const caToMg = ions.Mg > 0 ? ions.Ca / ions.Mg : 0;
+  const clToSO4 = ions.SO4 > 0 ? ions.Cl / ions.SO4 : 0;
+  const hToA = KH > 0 ? GH / KH : 0;
+  return { GH, KH, TDS, conductivity, ecTds, tempHardness, permHardness, caToMg, clToSO4, hToA, ionsMgL, ionsCaCO3 };
+}
+
+function WaterDesigner({ globalParams, concentrateData, designState, setDesignState }) {
   const { brewMl, dropG } = globalParams;
-  const toggle = id => setSel(p => p.includes(id) ? p.filter(x => x !== id) : [...p, id]);
-  const results = useMemo(() => solveReverse(targets, sel), [targets, sel]);
-  const stats = useMemo(() => results ? calcWaterStats(results, brewMl || 500) : null, [results, brewMl]);
+  const { ions, sel, locks, silica } = designState;
+
+  const togLock = (k) => setDesignState(p => ({ ...p, locks: { ...p.locks, [k]: !p.locks[k] } }));
+  const togMin = (id) => setDesignState(p => ({
+    ...p, sel: p.sel.includes(id) ? p.sel.filter(x => x !== id) : [...p.sel, id]
+  }));
+
+  const st = useMemo(() => computeStats(ions, silica), [ions, silica]);
+
+  // --- ION EDIT with lock constraints ---
+  const setIonFromMgL = (key, mgL) => {
+    if (locks["ion_" + key]) return;
+    const newMmol = mgL / MW[key];
+    applyIonChange(key, newMmol);
+  };
+
+  const setIonFromCaCO3 = (key, caco3) => {
+    if (locks["ion_" + key]) return;
+    const f = ION_FIELDS.find(x => x.key === key);
+    const newMmol = caco3 / (f.valence === 2 ? 100 : 50);
+    applyIonChange(key, newMmol);
+  };
+
+  const applyIonChange = (key, newMmol) => {
+    setDesignState(p => {
+      const ni = { ...p.ions, [key]: Math.max(0, newMmol) };
+
+      // If GH locked and changing Ca or Mg, adjust the other
+      if (p.locks.gh && (key === "Ca" || key === "Mg")) {
+        const oldGH = (p.ions.Ca + p.ions.Mg) * 100;
+        const other = key === "Ca" ? "Mg" : "Ca";
+        if (!p.locks["ion_" + other]) {
+          ni[other] = Math.max(0, oldGH / 100 - ni[key]);
+        }
+      }
+
+      // If GH:KH ratio locked, propagate
+      if (p.locks.hToA && st.hToA > 0) {
+        const newGH = (ni.Ca + ni.Mg) * 100;
+        const newKH = newGH / st.hToA;
+        if (!p.locks.kh && !p.locks.ion_HCO3) {
+          ni.HCO3 = newKH / 50;
+        }
+      }
+
+      return { ...p, ions: ni };
+    });
+  };
+
+  // --- SUMMARY STAT EDITS ---
+  const setGH = (v) => {
+    if (locks.gh) return;
+    const newTotal = Math.max(0, v) / 100;
+    setDesignState(p => {
+      const oldTotal = p.ions.Ca + p.ions.Mg;
+      const ni = { ...p.ions };
+      if (oldTotal > 0) {
+        const ratio = newTotal / oldTotal;
+        if (!p.locks.ion_Ca) ni.Ca = p.ions.Ca * ratio;
+        if (!p.locks.ion_Mg) ni.Mg = p.ions.Mg * ratio;
+      } else {
+        if (!p.locks.ion_Mg) ni.Mg = newTotal;
+      }
+      // GH:KH ratio lock
+      if (p.locks.hToA && st.hToA > 0 && !p.locks.kh && !p.locks.ion_HCO3) {
+        ni.HCO3 = (newTotal * 100 / st.hToA) / 50;
+      }
+      return { ...p, ions: ni };
+    });
+  };
+
+  const setKH = (v) => {
+    if (locks.kh) return;
+    if (locks.ion_HCO3) return;
+    setDesignState(p => {
+      const ni = { ...p.ions, HCO3: Math.max(0, v) / 50 };
+      // GH:KH ratio lock
+      if (p.locks.hToA && st.hToA > 0 && !p.locks.gh) {
+        const newGH = v * st.hToA;
+        const newTotal = newGH / 100;
+        const oldTotal = p.ions.Ca + p.ions.Mg;
+        if (oldTotal > 0) {
+          const ratio = newTotal / oldTotal;
+          if (!p.locks.ion_Ca) ni.Ca = p.ions.Ca * ratio;
+          if (!p.locks.ion_Mg) ni.Mg = p.ions.Mg * ratio;
+        }
+      }
+      return { ...p, ions: ni };
+    });
+  };
+
+  const setCaToMg = (v) => {
+    if (locks.caToMg) return;
+    const totalMmol = ions.Ca + ions.Mg;
+    if (totalMmol <= 0) return;
+    setDesignState(p => {
+      const ni = { ...p.ions };
+      const newMg = totalMmol / (v + 1);
+      const newCa = v * newMg;
+      if (!p.locks.ion_Ca) ni.Ca = newCa;
+      if (!p.locks.ion_Mg) ni.Mg = newMg;
+      return { ...p, ions: ni };
+    });
+  };
+
+  const setClToSO4 = (v) => {
+    if (locks.clToSO4) return;
+    const totalAnion = ions.Cl + ions.SO4;
+    if (totalAnion <= 0) return;
+    setDesignState(p => {
+      const ni = { ...p.ions };
+      const newSO4 = totalAnion / (v + 1);
+      const newCl = v * newSO4;
+      if (!p.locks.ion_Cl) ni.Cl = newCl;
+      if (!p.locks.ion_SO4) ni.SO4 = newSO4;
+      return { ...p, ions: ni };
+    });
+  };
+
+  const setHToA = (v) => {
+    if (locks.hToA) return;
+    // Just set the ratio — don't change ions. Ratio is derived.
+    // Instead treat as: keep GH, change KH = GH / v
+    if (v > 0 && !locks.kh && !locks.ion_HCO3) {
+      const newKH = st.GH / v;
+      setDesignState(p => ({ ...p, ions: { ...p.ions, HCO3: newKH / 50 } }));
+    }
+  };
+
+  const setTDS = (v) => {
+    if (!locks.tds) return; // TDS only editable when locked
+    if (st.TDS <= 0) return;
+    const factor = v / st.TDS;
+    setDesignState(p => {
+      const ni = { ...p.ions };
+      ION_FIELDS.forEach(({ key }) => {
+        if (!p.locks["ion_" + key] && !p.locks.gh && !p.locks.kh) {
+          ni[key] = ni[key] * factor;
+        } else if (!p.locks["ion_" + key]) {
+          // Respect GH/KH locks by skipping their constituent ions
+          if (p.locks.gh && (key === "Ca" || key === "Mg")) return;
+          if (p.locks.kh && key === "HCO3") return;
+          ni[key] = ni[key] * factor;
+        }
+      });
+      const ns = (!p.locks.silica) ? +((p.silica || 0) * factor).toFixed(1) : p.silica;
+      return { ...p, ions: ni, silica: ns };
+    });
+  };
+
+  const setSilica = (v) => { if (!locks.silica) setDesignState(p => ({ ...p, silica: Math.max(0, v) })); };
+
+  const { results } = useMemo(() => ionSolve(ions, sel, silica), [ions, sel, silica]);
+  const fullStats = useMemo(() => results.length > 0 ? calcWaterStats(results, brewMl || 500) : null, [results, brewMl]);
+
+  // Compare target ions vs actual solved ions — flag mismatches
+  const allWarnings = useMemo(() => {
+    const w = [];
+    if (!fullStats) return w;
+
+    // Lookup: which unselected minerals could supply a given ion
+    const fixesFor = (ionKey) => {
+      const fixes = [];
+      MINERALS.filter(m => !m.isPreConcentrate && !sel.includes(m.id)).forEach(m => {
+        const test = m.ionMmol(1);
+        if (test[ionKey] > 0) fixes.push({ mineral: m.common, id: m.id });
+      });
+      return fixes;
+    };
+
+    // Lookup: which selected minerals are contributing a given ion
+    const sourcesOf = (ionKey) => {
+      const sources = [];
+      results.forEach(({ mineralId }) => {
+        const m = MINERALS.find(x => x.id === mineralId);
+        if (!m) return;
+        const test = m.ionMmol(1);
+        if (test[ionKey] > 0) sources.push(m.common);
+      });
+      return sources;
+    };
+
+    // Which ions does a mineral carry alongside the one we want?
+    const coupledIons = (mineralId, targetIon) => {
+      const m = MINERALS.find(x => x.id === mineralId);
+      if (!m) return [];
+      const test = m.ionMmol(1);
+      return ION_FIELDS.filter(f => f.key !== targetIon && test[f.key] > 0).map(f => f.label);
+    };
+
+    ION_FIELDS.forEach(({ key, label }) => {
+      const targetMgL = ions[key] * MW[key];
+      const actualMgL = (fullStats.ionsMmol[key] || 0) * MW[key];
+      const diffMgL = actualMgL - targetMgL;
+
+      // Zero-target check FIRST — before percentage threshold
+      if (targetMgL < 0.01 && actualMgL > 0.5) {
+        const sources = sourcesOf(key);
+        w.push({
+          key,
+          msg: `${label} target is 0 but ${actualMgL.toFixed(1)} mg/L in solution — unavoidably coupled with ${sources.join(", ")}`,
+        });
+        return; // skip further checks for this ion
+      }
+
+      const absThresh = Math.max(targetMgL * 0.05, 0.5);
+
+      if (targetMgL > 0.01 && diffMgL < -absThresh) {
+        // DEFICIT: actual < target
+        const deficit = -diffMgL;
+        const unselectedFixes = fixesFor(key);
+        // Also find selected minerals that carry this ion but could be increased via their other ion
+        const selectedBoosts = [];
+        MINERALS.filter(m => !m.isPreConcentrate && sel.includes(m.id)).forEach(m => {
+          const test = m.ionMmol(1);
+          if (test[key] > 0) {
+            const otherIons = ION_FIELDS.filter(f => f.key !== key && test[f.key] > 0).map(f => f.label);
+            if (otherIons.length > 0) {
+              selectedBoosts.push(`increase ${otherIons.join("/")} (via ${m.common})`);
+            }
+          }
+        });
+
+        let msg = `${label} is ${actualMgL.toFixed(1)} mg/L — need ${deficit.toFixed(1)} more to reach target of ${targetMgL.toFixed(1)}. `;
+        const suggestions = [];
+        if (unselectedFixes.length > 0) {
+          suggestions.push(`add ${unselectedFixes.map(f => {
+            const coupled = coupledIons(f.id, key);
+            return f.mineral + (coupled.length ? ` (adds ${coupled.join(", ")})` : "");
+          }).join(" or ")} to available minerals`);
+        }
+        if (selectedBoosts.length > 0) {
+          suggestions.push(selectedBoosts.join(" or "));
+        }
+        msg += suggestions.length > 0 ? suggestions.join("; or ") : "No mineral available to supply it";
+        w.push({ key, msg });
+      } else if (targetMgL > 0.01 && diffMgL > absThresh) {
+        // EXCESS: actual > target
+        const excess = diffMgL;
+        const sources = sourcesOf(key);
+        let msg = `${label} is ${actualMgL.toFixed(1)} mg/L — ${excess.toFixed(1)} above target of ${targetMgL.toFixed(1)}. `;
+        msg += `Coupled with ${sources.join(", ")} — reduce ${sources.map(s => {
+          const m = MINERALS.find(x => x.common === s);
+          if (!m) return s;
+          const mainIon = ION_FIELDS.find(f => {
+            const test = m.ionMmol(1);
+            return test[f.key] > 0 && f.key !== key;
+          });
+          return mainIon ? mainIon.label : s;
+        }).join(" or ")} to lower`;
+        w.push({ key, msg });
+      }
+    });
+
+    return w;
+  }, [fullStats, ions, results, sel]);
+
+  const warnKeys = new Set(allWarnings.map(w => w.key));
+
+  // Helper: stat card style
+  const sc = (k, color, small) => ({
+    background: C.surfaceAlt, borderRadius: 8,
+    padding: small ? "6px 10px" : "10px 14px",
+    border: `1px solid ${locks[k] ? color + "55" : C.border}`,
+    flex: 1, minWidth: small ? 115 : 140,
+  });
+
+  const inputStyle = (color, small) => ({
+    background: C.inputBg, border: `1px solid ${C.border}`, borderRadius: 4,
+    color, padding: "3px 6px", fontSize: small ? 14 : 16, fontWeight: 700, width: "100%",
+    outline: "none", fontFamily: "'JetBrains Mono', monospace",
+  });
+
+  const lbl = { fontSize: 10, color: C.textDim, textTransform: "uppercase", letterSpacing: 0.8 };
+
+  const StatInput = ({ label, value, unit, color, k, onChange, step = 1, small = false, readOnly = false, warn = false }) => (
+    <div style={{ ...sc(k, color, small), borderColor: warn ? C.warn + "88" : (locks[k] ? color + "55" : C.border) }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 3 }}>
+        <div style={lbl}>{label}</div>
+        {k && <LockBtn locked={!!locks[k]} onClick={() => togLock(k)} />}
+      </div>
+      {!readOnly && onChange ? (
+        <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
+          <input type="number" value={typeof value === "number" ? +value.toFixed(2) : 0}
+            onChange={e => onChange(e.target.value === "" ? 0 : +e.target.value)}
+            min={0} step={step}
+            style={inputStyle(color, small)}
+            onFocus={e => e.target.style.borderColor = color}
+            onBlur={e => e.target.style.borderColor = C.border} />
+          {unit && <span style={{ fontSize: 10, color: C.textDim, whiteSpace: "nowrap" }}>{unit}</span>}
+        </div>
+      ) : (
+        <div style={{ fontSize: small ? 14 : 16, fontWeight: 700, color: readOnly ? C.textDim : color, fontFamily: "'JetBrains Mono', monospace" }}>
+          {typeof value === "number" ? value.toFixed(1) : value}
+          {unit && <span style={{ fontSize: 10, color: C.textDim, marginLeft: 3 }}>{unit}</span>}
+        </div>
+      )}
+    </div>
+  );
 
   return (
     <div>
-      <p style={{ fontSize: 12, color: C.textDim, marginBottom: 16, lineHeight: 1.6 }}>
-        Set target characteristics and select available minerals. The tool solves for the recipe.
-      </p>
-      <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 16 }}>
-        {[{ k: "gh", label: "Target GH", unit: "ppm CaCO₃", step: 5 }, { k: "kh", label: "Target KH", unit: "ppm CaCO₃", step: 5 },
-          { k: "caToMg", label: "Ca : Mg Ratio", step: 0.1 }, { k: "clToSO4", label: "Cl⁻ : SO₄²⁻ Ratio", step: 0.1 }
-        ].map(({ k, label, unit, step }) => (
-          <div key={k} style={{ flex: 1, minWidth: 120 }}>
-            <label style={{ fontSize: 10, color: C.textDim, textTransform: "uppercase", letterSpacing: 0.8 }}>{label}</label>
-            <NI value={targets[k]} onChange={v => setTargets(p => ({ ...p, [k]: v }))} min={0} step={step} unit={unit || ""} />
-          </div>
-        ))}
-      </div>
-      <div style={{ background: C.surfaceAlt, borderRadius: 8, padding: 12, marginBottom: 16, border: `1px solid ${C.border}` }}>
-        <div style={{ fontSize: 10, color: C.textDim, textTransform: "uppercase", letterSpacing: 0.8, marginBottom: 8 }}>Select Available Minerals</div>
+      {/* Mineral selection — ALL minerals */}
+      <div style={{ background: C.surfaceAlt, borderRadius: 8, padding: 12, marginBottom: 14, border: `1px solid ${C.border}` }}>
+        <div style={{ ...lbl, marginBottom: 8 }}>Available Minerals</div>
         <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
-          {MINERALS.filter(m => m.category !== "other").map(m => (
-            <button key={m.id} onClick={() => toggle(m.id)} style={{
-              background: sel.includes(m.id) ? catC[m.category] + "22" : "transparent",
-              border: `1px solid ${sel.includes(m.id) ? catC[m.category] : C.border}`,
+          {MINERALS.filter(m => !m.isPreConcentrate).map(m => (
+            <button key={m.id} onClick={() => togMin(m.id)} style={{
+              background: sel.includes(m.id) ? (catC[m.category] || C.other) + "22" : "transparent",
+              border: `1px solid ${sel.includes(m.id) ? (catC[m.category] || C.other) : C.border}`,
               borderRadius: 6, padding: "4px 10px", cursor: "pointer",
-              color: sel.includes(m.id) ? catC[m.category] : C.textDim, fontSize: 11, fontWeight: 500,
+              color: sel.includes(m.id) ? (catC[m.category] || C.other) : C.textDim, fontSize: 11, fontWeight: 500,
             }}>{m.common}</button>
           ))}
         </div>
       </div>
-      {results?.length > 0 ? (
-        <div>
-          <div style={{ fontSize: 12, fontWeight: 700, color: C.textBright, marginBottom: 8 }}>Recipe</div>
-          {results.map(({ mineralId, ppm }) => {
+
+      {/* Row 1: GH, KH, TDS, EC */}
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
+        <StatInput label="GH (as CaCO₃)" value={st.GH} unit="ppm" color={C.gh}
+          k="gh" onChange={!locks.gh ? setGH : undefined} step={1} readOnly={!!locks.gh} />
+        <StatInput label="KH (as CaCO₃)" value={st.KH} unit="ppm" color={C.kh}
+          k="kh" onChange={!locks.kh ? setKH : undefined} step={1} readOnly={!!locks.kh} />
+        <StatInput label="TDS" value={st.TDS} unit="mg/L" color={C.accent}
+          k="tds" onChange={locks.tds ? setTDS : undefined} step={1}
+          readOnly={!locks.tds} />
+        <StatInput label="EC TDS Meter" value={st.ecTds} unit="ppm" color={C.accent} readOnly />
+      </div>
+
+      {/* Row 2: Ratios */}
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
+        {/* GH:KH */}
+        <div style={{ ...sc("hToA", C.accent, true) }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 3 }}>
+            <div style={lbl}>GH : KH</div>
+            <LockBtn locked={!!locks.hToA} onClick={() => togLock("hToA")} />
+          </div>
+          {st.KH > 0 ? (
+            <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
+              <input type="number" value={+st.hToA.toFixed(2)} min={0} step={0.1}
+                onChange={e => !locks.hToA && setHToA(e.target.value === "" ? 0 : +e.target.value)}
+                readOnly={!!locks.hToA}
+                style={inputStyle(C.accent, true)}
+                onFocus={e => e.target.style.borderColor = C.accent}
+                onBlur={e => e.target.style.borderColor = C.border} />
+              <span style={{ fontSize: 10, color: C.textDim }}>GH/KH</span>
+            </div>
+          ) : (
+            <div>
+              <div style={{ fontSize: 13, fontWeight: 700, color: C.textDim, fontFamily: "'JetBrains Mono', monospace" }}>
+                {st.GH > 0 ? "∞" : "—"}
+              </div>
+              <div style={{ fontSize: 10, color: C.warn }}>
+                {st.KH === 0 && st.GH > 0 ? "Set KH > 0 to enable" : "Set GH and KH > 0"}
+              </div>
+            </div>
+          )}
+          {fullStats && st.KH > 0 && Math.abs(fullStats.GH / fullStats.KH - st.hToA) > 0.05 && (
+            <div style={{ fontSize: 10, color: C.warn, marginTop: 2 }}>Actual: {(fullStats.GH / fullStats.KH).toFixed(2)}</div>
+          )}
+        </div>
+
+        {/* Ca:Mg */}
+        <div style={{ ...sc("caToMg", C.gh, true) }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 3 }}>
+            <div style={lbl}>Ca : Mg</div>
+            <LockBtn locked={!!locks.caToMg} onClick={() => togLock("caToMg")} />
+          </div>
+          {ions.Mg > 0 && ions.Ca >= 0 ? (
+            <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
+              <input type="number" value={+st.caToMg.toFixed(2)} min={0} step={0.1}
+                onChange={e => !locks.caToMg && setCaToMg(e.target.value === "" ? 0 : +e.target.value)}
+                readOnly={!!locks.caToMg}
+                style={inputStyle(C.gh, true)}
+                onFocus={e => e.target.style.borderColor = C.gh}
+                onBlur={e => e.target.style.borderColor = C.border} />
+              <span style={{ fontSize: 10, color: C.textDim }}>Ca/Mg</span>
+            </div>
+          ) : ions.Ca > 0 && ions.Mg === 0 ? (
+            <div>
+              <div style={{ fontSize: 13, fontWeight: 700, color: C.textDim, fontFamily: "'JetBrains Mono', monospace" }}>Ca only</div>
+              <div style={{ fontSize: 10, color: C.warn }}>Set Mg²⁺ > 0 to adjust ratio</div>
+            </div>
+          ) : (
+            <div>
+              <div style={{ fontSize: 13, fontWeight: 700, color: C.textDim, fontFamily: "'JetBrains Mono', monospace" }}>—</div>
+              <div style={{ fontSize: 10, color: C.textDim }}>Set Ca²⁺ or Mg²⁺ > 0</div>
+            </div>
+          )}
+          {fullStats && ions.Mg > 0 && fullStats.ionsMmol.Mg > 0 && (
+            (() => {
+              const actual = fullStats.ionsMmol.Ca / fullStats.ionsMmol.Mg;
+              return Math.abs(actual - st.caToMg) > 0.05
+                ? <div style={{ fontSize: 10, color: C.warn, marginTop: 2 }}>Actual: {actual.toFixed(2)}</div>
+                : null;
+            })()
+          )}
+        </div>
+
+        {/* Cl:SO4 */}
+        <div style={{ ...sc("clToSO4", C.accent, true) }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 3 }}>
+            <div style={lbl}>Cl⁻ : SO₄²⁻</div>
+            <LockBtn locked={!!locks.clToSO4} onClick={() => togLock("clToSO4")} />
+          </div>
+          {ions.SO4 > 0 && ions.Cl >= 0 ? (
+            <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
+              <input type="number" value={+st.clToSO4.toFixed(2)} min={0} step={0.1}
+                onChange={e => !locks.clToSO4 && setClToSO4(e.target.value === "" ? 0 : +e.target.value)}
+                readOnly={!!locks.clToSO4}
+                style={inputStyle(C.accent, true)}
+                onFocus={e => e.target.style.borderColor = C.accent}
+                onBlur={e => e.target.style.borderColor = C.border} />
+              <span style={{ fontSize: 10, color: C.textDim }}>Cl/SO₄</span>
+            </div>
+          ) : ions.Cl > 0 && ions.SO4 === 0 ? (
+            <div>
+              <div style={{ fontSize: 13, fontWeight: 700, color: C.textDim, fontFamily: "'JetBrains Mono', monospace" }}>Cl⁻ only</div>
+              <div style={{ fontSize: 10, color: C.warn }}>Set SO₄²⁻ > 0 to adjust ratio</div>
+            </div>
+          ) : (
+            <div>
+              <div style={{ fontSize: 13, fontWeight: 700, color: C.textDim, fontFamily: "'JetBrains Mono', monospace" }}>—</div>
+              <div style={{ fontSize: 10, color: C.textDim }}>Set Cl⁻ or SO₄²⁻ > 0</div>
+            </div>
+          )}
+          {fullStats && ions.SO4 > 0 && fullStats.ionsMmol.SO4 > 0 && (
+            (() => {
+              const actual = fullStats.ionsMmol.Cl / fullStats.ionsMmol.SO4;
+              return Math.abs(actual - st.clToSO4) > 0.05
+                ? <div style={{ fontSize: 10, color: C.warn, marginTop: 2 }}>Actual: {actual.toFixed(2)}</div>
+                : null;
+            })()
+          )}
+        </div>
+      </div>
+
+      {/* Row 3: Derived */}
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
+        <StatInput label="Permanent Hardness" value={st.permHardness} unit="ppm" color={C.gh} small readOnly />
+        <StatInput label="Temporary Hardness" value={st.tempHardness} unit="ppm" color={C.kh} small readOnly />
+        <StatInput label="Conductivity" value={st.conductivity} unit="µS/cm" color={C.textDim} small readOnly />
+      </div>
+
+      {/* ION TARGETS */}
+      <div style={{
+        background: C.surface, borderRadius: 10, padding: "12px 10px", marginBottom: 10,
+        border: `1px solid ${C.border}`,
+      }}>
+        <div style={{ ...lbl, marginBottom: 10 }}>Ion Targets</div>
+        <div style={{ display: "grid", gridTemplateColumns: "30px 50px 1fr 56px 1fr 56px", gap: "4px 5px", alignItems: "center", fontSize: 12 }}>
+          <div /><div />
+          <div style={{ fontSize: 9, color: C.textDim, textAlign: "center" }}>mg/L</div><div />
+          <div style={{ fontSize: 9, color: C.textDim, textAlign: "center" }}>ppm CaCO₃</div><div />
+
+          {ION_FIELDS.map(({ key, label, color, valence }) => {
+            const mgL = ions[key] * MW[key];
+            const caco3 = ions[key] * (valence === 2 ? 100 : 50);
+            const isWarn = warnKeys.has(key);
+            const borderWarn = isWarn ? C.warn + "66" : C.border;
+            return (
+              <React.Fragment key={key}>
+                <LockBtn locked={!!locks["ion_" + key]} onClick={() => togLock("ion_" + key)} />
+                <span style={{ fontWeight: 600, color: isWarn ? C.warn : color, fontSize: 12 }}>{label}</span>
+                <input type="number" value={+mgL.toFixed(2)} min={0} step={0.5}
+                  onChange={e => setIonFromMgL(key, e.target.value === "" ? 0 : +e.target.value)}
+                  style={{ ...inputStyle(C.textBright, true), borderColor: borderWarn }}
+                  onFocus={e => e.target.style.borderColor = color}
+                  onBlur={e => e.target.style.borderColor = borderWarn} />
+                <span style={{ fontSize: 10, color: C.textDim }}>mg/L</span>
+                <input type="number" value={+caco3.toFixed(2)} min={0} step={1}
+                  onChange={e => setIonFromCaCO3(key, e.target.value === "" ? 0 : +e.target.value)}
+                  style={{ ...inputStyle(C.textBright, true), borderColor: borderWarn }}
+                  onFocus={e => e.target.style.borderColor = color}
+                  onBlur={e => e.target.style.borderColor = borderWarn} />
+                <span style={{ fontSize: 10, color: C.textDim }}>CaCO₃</span>
+              </React.Fragment>
+            );
+          })}
+
+          <LockBtn locked={!!locks.silica} onClick={() => togLock("silica")} />
+          <span style={{ fontWeight: 600, color: "#9a8ab0", fontSize: 12 }}>SiO₂</span>
+          <input type="number" value={silica || 0} min={0} step={0.5}
+            onChange={e => setSilica(e.target.value === "" ? 0 : +e.target.value)}
+            style={inputStyle(C.textBright, true)}
+            onFocus={e => e.target.style.borderColor = "#9a8ab0"}
+            onBlur={e => e.target.style.borderColor = C.border} />
+          <span style={{ fontSize: 10, color: C.textDim }}>mg/L</span>
+          <span style={{ fontSize: 10, color: C.textDim, gridColumn: "span 2" }}>uncharged</span>
+        </div>
+      </div>
+
+      {/* Warnings */}
+      {allWarnings.length > 0 && (
+        <div style={{
+          background: C.warn + "11", borderRadius: 8, padding: "10px 14px", marginBottom: 10,
+          border: `1px solid ${C.warn}33`,
+        }}>
+          <div style={{ fontSize: 10, color: C.warn, textTransform: "uppercase", letterSpacing: 0.8, marginBottom: 6, fontWeight: 700 }}>
+            Target Constraints
+          </div>
+          {allWarnings.map((w, i) => (
+            <div key={i} style={{ fontSize: 12, color: C.warn, marginBottom: 2 }}>
+              ⚠️ <b>{w.key}</b>: {w.msg}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Ion charts */}
+      {fullStats && <IonChart stats={fullStats} />}
+
+      {/* Recipe output */}
+      {results.filter(r => r.mineralId !== "sio2").length > 0 && (
+        <div style={{
+          background: C.surfaceAlt, borderRadius: 8, padding: 12, marginTop: 10,
+          border: `1px solid ${C.border}`,
+        }}>
+          <div style={{ ...lbl, marginBottom: 8 }}>Mineral Recipe</div>
+          {results.filter(r => r.mineralId !== "sio2").map(({ mineralId, ppm }) => {
             const m = MINERALS.find(x => x.id === mineralId);
+            if (!m) return null;
             const isCaCO3 = m.ppmFactor !== null;
             const tpd = concentrateData[mineralId] || 1;
             const drops = tpd > 0 ? ppm / tpd : 0;
             const ml = drops * (dropG || 0.04);
             return (
-              <div key={mineralId} style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 4, flexWrap: "wrap",
-                background: C.surface, borderRadius: 6, padding: "8px 12px", border: `1px solid ${C.border}` }}>
-                <div style={{ flex: 1, minWidth: 160 }}>
+              <div key={mineralId} style={{
+                display: "flex", alignItems: "center", gap: 10, marginBottom: 4, flexWrap: "wrap",
+                background: C.surface, borderRadius: 6, padding: "6px 12px", border: `1px solid ${C.border}`,
+              }}>
+                <div style={{ flex: 1, minWidth: 140 }}>
                   <span style={{ fontSize: 12, fontWeight: 600, color: C.textBright }}>{m.common}</span>
                   <span style={{ fontSize: 10, color: C.textDim, marginLeft: 6 }}>{m.formula}</span>
                 </div>
-                {[{ l: isCaCO3 ? "ppm CaCO₃" : "mg/L", v: ppm.toFixed(1), c: catC[m.category] },
-                  { l: "drops", v: drops.toFixed(1), c: C.accent }, { l: "ml conc.", v: ml.toFixed(2), c: C.accent }
+                {[{ l: isCaCO3 ? "ppm CaCO₃" : "mg/L", v: ppm.toFixed(1), c: catC[m.category] || C.other },
+                  { l: "drops", v: drops.toFixed(1), c: C.accent },
+                  { l: "ml conc.", v: ml.toFixed(2), c: C.accent }
                 ].map(({ l, v, c }, i) => (
                   <div key={i} style={{ background: C.inputBg, borderRadius: 4, padding: "3px 8px", border: `1px solid ${C.border}`, textAlign: "center" }}>
                     <div style={{ fontSize: 9, color: C.textDim }}>{l}</div>
-                    <div style={{ fontSize: 14, fontWeight: 700, color: c, fontFamily: "'JetBrains Mono', monospace" }}>{v}</div>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: c, fontFamily: "'JetBrains Mono', monospace" }}>{v}</div>
                   </div>
                 ))}
               </div>
             );
           })}
-          <div style={{ marginTop: 16 }}>
-            <div style={{ fontSize: 12, fontWeight: 700, color: C.textBright, marginBottom: 10 }}>Resulting Brew Water Analysis</div>
-            <WaterStats stats={stats} />
-          </div>
-        </div>
-      ) : (
-        <div style={{ fontSize: 12, color: C.textDim, padding: 20, textAlign: "center" }}>
-          Select at least one Mg source, one Ca source, and one buffer.
         </div>
       )}
     </div>
   );
 }
-
 // ─── RECIPE ANALYZER ──────────────────────────────────────────────────────────
 const RECIPE_MINERALS = MINERALS.filter(m => m.id !== "sio2");
 
@@ -999,16 +1588,20 @@ function App() {
   });
   const [mode, setMode] = useState("forward");
 
-  // Forward crafter state (lifted so it persists across tab switches)
+  // Forward crafter state
   const [fwdAmounts, setFwdAmounts] = useState({
     mgcl2_6h2o: 13, nacl: 13, nahco3: 8,
   });
 
-  // Reverse crafter state (lifted)
-  const [revTargets, setRevTargets] = useState({ gh: 60, kh: 20, caToMg: 1.3, clToSO4: 1.0 });
-  const [revSel, setRevSel] = useState(["mgcl2_6h2o", "mgso4_7h2o", "cacl2_2h2o", "nahco3"]);
+  // Water designer state — ions in mmol/L as source of truth
+  const [designState, setDesignState] = useState({
+    ions: { Ca: 0, Mg: 0.13, Na: 0.22, K: 0, HCO3: 0.16, Cl: 0.48, SO4: 0 },
+    sel: ["mgcl2_6h2o", "mgso4_7h2o", "cacl2", "nahco3", "nacl"],
+    locks: {},
+    silica: 0,
+  });
 
-  // Recipe analyzer state (lifted)
+  // Recipe analyzer state
   const [recipe, setRecipe] = useState({
     mode: "direct", brewMl: 1000, linked: true, concVol: 500, dose: 2,
     grams: {}, perMineral: {}, silicaPpm: 0,
@@ -1040,11 +1633,11 @@ function App() {
             <SH icon="⚗️">Water Crafter</SH>
             <div style={{ display: "flex", gap: 6, marginBottom: 16, flexWrap: "wrap" }}>
               <Tab active={mode === "forward"} onClick={() => setMode("forward")}>Minerals → Stats</Tab>
-              <Tab active={mode === "reverse"} onClick={() => setMode("reverse")}>Targets → Recipe</Tab>
+              <Tab active={mode === "designer"} onClick={() => setMode("designer")}>🎯 Water Designer</Tab>
               <Tab active={mode === "recipe"} onClick={() => setMode("recipe")}>📋 Recipe Analyzer</Tab>
             </div>
             {mode === "forward" && <ForwardCrafter globalParams={gp} concentrateData={cd} amounts={fwdAmounts} setAmounts={setFwdAmounts} />}
-            {mode === "reverse" && <ReverseCrafter globalParams={gp} concentrateData={cd} targets={revTargets} setTargets={setRevTargets} sel={revSel} setSel={setRevSel} />}
+            {mode === "designer" && <WaterDesigner globalParams={gp} concentrateData={cd} designState={designState} setDesignState={setDesignState} />}
             {mode === "recipe" && <RecipeAnalyzer recipe={recipe} setRecipe={setRecipe} />}
           </div>
         )}
